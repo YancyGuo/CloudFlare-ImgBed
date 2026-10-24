@@ -2,6 +2,7 @@ import { fetchOthersConfig } from "../utils/sysConfig";
 import { matchesFileType } from "../utils/mimeTypes";
 import { readIndex } from "../utils/indexManager";
 import { detectDevice, resolveOrientation, addClientHintsHeaders } from "./adaptive.js";
+import { selectStableFile } from "./stable.js";
 
 // CORS 跨域响应头
 const corsHeaders = {
@@ -90,6 +91,16 @@ export async function onRequest(context) {
         return new Response(JSON.stringify({ error: "Directory not allowed" }), { status: 403, headers: corsHeaders });
     }
 
+    // Stable mode consumes NotionNext's existing article ID parameter; legacy calls stay random.
+    const stableMode = requestUrl.searchParams.get('mode') === 'stable';
+    const articleId = requestUrl.searchParams.get('t')?.trim();
+    if (stableMode && (!articleId || articleId.length > 256)) {
+        return new Response(JSON.stringify({ error: "Stable mode requires an article ID (t), up to 256 characters" }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Cache-Control': 'no-store' },
+        });
+    }
+
     // 调用randomFileList接口，读取KV数据库中的所有记录
     let allRecords = await getRandomFileList(context, requestUrl, dir);
 
@@ -135,9 +146,16 @@ export async function onRequest(context) {
     if (allRecords.length == 0) {
         return new Response(JSON.stringify({}), { status: 200, headers: responseHeaders });
     } else {
-        const randomIndex = Math.floor(Math.random() * allRecords.length);
-        const randomKey = allRecords[randomIndex];
-        const randomPath = '/file/' + randomKey.name;
+        const randomKey = stableMode
+            ? selectStableFile(allRecords, articleId)
+            : allRecords[Math.floor(Math.random() * allRecords.length)];
+        const randomPath = '/file/' + (stableMode
+            ? randomKey.name.split('/').map(encodeURIComponent).join('/')
+            : randomKey.name);
+        if (stableMode) {
+            // Browser caching saves repeated selection. Auto mode varies per device.
+            responseHeaders.set('Cache-Control', `${isAutoMode ? 'private' : 'public'}, max-age=86400`);
+        }
         let randomUrl = randomPath;
 
         const randomType = requestUrl.searchParams.get('type');
@@ -150,6 +168,11 @@ export async function onRequest(context) {
 
         // if param 'type' is set to 'img', return the image
         if (randomType == 'img') {
+            if (stableMode) {
+                // Let clients reuse the file route's cache instead of buffering another copy here.
+                responseHeaders.set('Location', requestUrl.origin + randomPath);
+                return new Response(null, { status: 302, headers: responseHeaders });
+            }
             // Return an image response
             randomUrl = requestUrl.origin + randomPath;
             let contentType = 'image/jpeg';
